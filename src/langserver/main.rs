@@ -999,6 +999,10 @@ handle_method_call! {
                     work_done_progress_options: Default::default(),
                 }),
                 color_provider: Some(ColorProviderCapability::Simple(true)),
+                rename_provider: Some(RenameProviderCapability::Options(RenameOptions {
+                    prepare_provider: Some(false),
+                    work_done_progress_options: Default::default()
+                })),
                 .. Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1762,6 +1766,32 @@ handle_method_call! {
                 .. Default::default()
             },
         ]
+    }
+
+    // need to fix range to make sure it selects the whole term,
+    // also need to make sure we are selecting the original location where the
+    // symbol appears -- right now it inserts instead of overwriting and not at the selected site
+    on Rename(&mut self, params) {
+        let symbol_id = self.symbol_id_at(params.text_document_position)?;
+
+        let mut result = &[][..];
+        if let Some(id) = symbol_id {
+            if let Some(ref table) = self.references_table {
+                result = table.find_references(id, true);
+            }
+        }
+        if result.is_empty() {
+            None
+        } else {
+            let mut output: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            for each in result {
+                if !each.is_builtins() {
+                    let loc_record = self.convert_location(*each, &[])?;
+                    output.entry(loc_record.uri).or_insert(Vec::new()).push(TextEdit::new(loc_record.range, params.new_name.clone()));
+                }
+            }
+            Some(WorkspaceEdit::new(output))
+        }
     }
 
     // ------------------------------------------------------------------------
