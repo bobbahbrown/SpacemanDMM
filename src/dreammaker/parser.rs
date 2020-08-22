@@ -292,6 +292,7 @@ pub struct Parser<'ctx, 'an, 'inp> {
     possible_indentation_error: bool,
     next: Option<Token>,
     location: Location,
+    end_location: Location,
     expected: Vec<Cow<'static, str>>,
 
     docs_following: DocCollection,
@@ -324,6 +325,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             possible_indentation_error: false,
             next: None,
             location: Default::default(),
+            end_location: Default::default(),
             expected: Vec::new(),
 
             docs_following: Default::default(),
@@ -466,6 +468,22 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 Some(token) => {
                     self.expected.clear();
                     self.location = token.location;
+
+                    if let Token::Eof = token.token {
+                        self.end_location = Location {
+                            file: self.location.file,
+                            line: self.location.line,
+                            column: self.location.column
+                        }
+                    }
+                    else {
+                        self.end_location = Location {
+                            file: self.location.file,
+                            line: self.location.line,
+                            column: self.location.column + format!("{}", token.token).chars().count() as u16
+                        }
+                    }
+
                     break Ok(token.token);
                 }
                 None => {
@@ -743,7 +761,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                         .register(self.context);
                 } else {
                     let len = self.tree[current].path.chars().filter(|&c| c == '/').count() + path_len;
-                    current = self.tree.subtype_or_add(self.location, current, each, len);
+                    current = self.tree.subtype_or_add(self.location, self.end_location, current, each, len);
                 }
             }
         }
@@ -786,6 +804,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             Punct(Assign) => {
                 // `something=` - var
                 let location = self.location;
+                let end_location = self.end_location;
                 // kind of goofy, but allows "enclosing" doc comments at the end of the line
                 let (docs, expression) = require!(self.doc_comment(|this| {
                     let expr = require!(this.expression());
@@ -799,9 +818,9 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
                 if let Some(mut var_type) = var_type {
                     var_type.suffix(&var_suffix);
-                    self.tree.declare_var(current, last_part, location, docs, var_type, Some(expression));
+                    self.tree.declare_var(current, last_part, location, end_location, docs, var_type, Some(expression));
                 } else {
-                    self.tree.override_var(current, last_part, location, docs, expression);
+                    self.tree.override_var(current, last_part, location, end_location, docs, expression);
                 }
 
                 SUCCESS
@@ -831,7 +850,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                         var_type.suffix(&var_suffix);
                         let node = self.tree[current].path.to_owned();
                         self.annotate(entry_start, || Annotation::Variable(reconstruct_path(&node, proc_kind, Some(&var_type), last_part)));
-                        self.tree.declare_var(current, last_part, self.location, docs, var_type, var_suffix.into_initializer());
+                        self.tree.declare_var(current, last_part, self.location, self.end_location, docs, var_type, var_suffix.into_initializer());
                     }
                 } else if ProcDeclKind::from_name(last_part).is_some() {
                     self.error("`proc;` item has no effect")
@@ -843,7 +862,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 } else {
                     let docs = std::mem::take(&mut self.docs_following);
                     let len = self.tree[current].path.chars().filter(|&c| c == '/').count() + path_len;
-                    current = self.tree.subtype_or_add(self.location, current, last_part, len);
+                    current = self.tree.subtype_or_add(self.location, self.end_location, current, last_part, len);
                     self.tree[current].docs.extend(docs);
                 }
 
@@ -935,6 +954,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
         leading!(self.exact(Punct(LParen)));
 
         let location = self.location;
+        let end_location = self.end_location;
         let parameters = require!(self.separated(Comma, RParen, None, Parser::proc_parameter));
 
         // split off a subparser so we can keep parsing the objtree
@@ -988,7 +1008,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             Code::Disabled
         };
 
-        match self.tree.register_proc(self.context, location, current, name, proc_kind, parameters, code) {
+        match self.tree.register_proc(self.context, location, end_location, current, name, proc_kind, parameters, code) {
             Ok((idx, proc)) => {
                 proc.docs.extend(comment);
                 // manually performed for borrowck reasons
@@ -1046,6 +1066,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 .register(self.context);
         }
         let location = self.location;
+        let end_location = self.end_location;
         // In parameters, the expression within the annotation is ignored.
         var_type.suffix(&require!(self.var_suffix()));
         // = <expr>
@@ -1071,6 +1092,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             input_type,
             in_list,
             location,
+            end_location,
         })
     }
 
@@ -1169,13 +1191,14 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
     fn statement(&mut self, loop_ctx: &LoopContext, vars: &mut Vec<(Location, VarType, String)>) -> Status<Spanned<Statement>> {
         let start = self.location();
-        let spanned = |v| success(Spanned::new(start, v));
+        let end = self.end_location;
+        let spanned = |v| success(Spanned::new(start, end, v));
 
         // BLOCK STATEMENTS
         if let Some(()) = self.exact_ident("if")? {
             // statement :: 'if' '(' expression ')' block ('else' 'if' '(' expression ')' block)* ('else' block)?
             require!(self.exact(Token::Punct(Punctuation::LParen)));
-            let expr = Spanned::new(self.location(), require!(self.expression()));
+            let expr = Spanned::new(self.location(), self.end_location, require!(self.expression()));
             require!(self.exact(Token::Punct(Punctuation::RParen)));
             let block = require!(self.block(loop_ctx));
             let mut arms = vec![(expr, block)];
@@ -1185,7 +1208,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             while let Some(()) = self.exact_ident("else")? {
                 if let Some(()) = self.exact_ident("if")? {
                     require!(self.exact(Token::Punct(Punctuation::LParen)));
-                    let expr = Spanned::new(self.location(), require!(self.expression()));
+                    let expr = Spanned::new(self.location(), self.end_location, require!(self.expression()));
                     require!(self.exact(Token::Punct(Punctuation::RParen)));
                     let block = require!(self.block(loop_ctx));
                     arms.push((expr, block));
@@ -1210,7 +1233,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             self.skip_phantom_semicolons()?;
             require!(self.exact_ident("while"));
             require!(self.exact(Token::Punct(Punctuation::LParen)));
-            let condition = Spanned::new(self.location(), require!(self.expression()));
+            let condition = Spanned::new(self.location(), self.end_location, require!(self.expression()));
             require!(self.exact(Token::Punct(Punctuation::RParen)));
             require!(self.statement_terminator());
             spanned(Statement::DoWhile { block, condition })
@@ -1360,7 +1383,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                     self.context.register_error(self.error("switch case cannot be empty"));
                 }
                 let block = require!(self.block(loop_ctx));
-                cases.push((Spanned::new(self.location(), what), block));
+                cases.push((Spanned::new(self.location(), self.end_location, what), block));
             }
             let default = if let Some(()) = self.exact_ident("else")? {
                 Some(require!(self.block(loop_ctx)))
@@ -1865,6 +1888,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
         use super::lexer::Punctuation::*;
 
         let start = self.updated_location();
+        let end = self.end_location;
         let term = match self.next("term")? {
             // term :: 'new' (prefab | (ident (index | field)*))? arglist?
             Token::Ident(ref i, _) if i == "new" => {
@@ -2076,7 +2100,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
             other => return self.try_another(other),
         };
-        success(Spanned::new(start, term))
+        success(Spanned::new(start, end, term))
     }
 
     fn follow(&mut self, belongs_to: &mut Vec<String>, in_ternary: bool) -> Status<Spanned<Follow>> {
@@ -2087,7 +2111,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 belongs_to.clear();
                 let expr = require!(self.expression());
                 require!(self.exact(Token::Punct(Punctuation::RBracket)));
-                return success(Spanned::new(first_location, Follow::Index(Box::new(expr))))
+                return success(Spanned::new(first_location, self.end_location, Follow::Index(Box::new(expr))))
             }
 
             // follow :: '.' ident arglist?
@@ -2132,7 +2156,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 Follow::Field(kind, ident)
             },
         };
-        success(Spanned::new(first_location, follow))
+        success(Spanned::new(first_location, self.end_location, follow))
     }
 
     // TODO: somehow fix the fact that this is basically copy-pasted from

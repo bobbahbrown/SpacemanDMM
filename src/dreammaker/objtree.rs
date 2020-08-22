@@ -56,6 +56,7 @@ pub struct VarDeclaration {
 #[derive(Debug, Clone)]
 pub struct VarValue {
     pub location: Location,
+    pub end_location: Location,
     /// Syntactic value, as specified in the source.
     pub expression: Option<Expression>,
     /// Evaluated value for non-static and non-tmp vars.
@@ -82,6 +83,7 @@ pub struct ProcDeclaration {
 #[derive(Debug, Clone)]
 pub struct ProcValue {
     pub location: Location,
+    pub end_location: Location,
     pub parameters: Vec<Parameter>,
     pub docs: DocCollection,
     pub code: Code,
@@ -116,6 +118,7 @@ pub struct Type {
     pub name: String,
     pub path: String,
     pub location: Location,
+    pub end_location: Location,
     location_specificity: usize,
     /// Variables which this type has declarations or overrides for.
     pub vars: LinkedHashMap<String, TypeVar>,
@@ -637,6 +640,7 @@ impl Default for ObjectTree {
             name: String::new(),
             path: String::new(),
             location: Default::default(),
+            end_location: Default::default(),
             location_specificity: 0,
             vars: Default::default(),
             procs: Default::default(),
@@ -840,7 +844,7 @@ impl ObjectTree {
     // ------------------------------------------------------------------------
     // Parsing
 
-    pub(crate) fn subtype_or_add(&mut self, location: Location, parent: NodeIndex, child: &str, len: usize) -> NodeIndex {
+    pub(crate) fn subtype_or_add(&mut self, location: Location, end_location: Location, parent: NodeIndex, child: &str, len: usize) -> NodeIndex {
         if let Some(&target) = self[parent].children.get(child) {
             let node = &mut self[target];
             if node.location_specificity > len {
@@ -859,6 +863,7 @@ impl ObjectTree {
             vars: Default::default(),
             procs: Default::default(),
             location,
+            end_location,
             location_specificity: len,
             parent_type: NodeIndex::end(),
             docs: Default::default(),
@@ -899,6 +904,7 @@ impl ObjectTree {
         ty: NodeIndex,
         name: &str,
         location: Location,
+        end_location: Location,
         docs: DocCollection,
         var_type: VarType,
         expression: Option<Expression>,
@@ -906,6 +912,7 @@ impl ObjectTree {
         let id = self.symbols.allocate();
         self.insert_var(ty, name, VarValue {
             location,
+            end_location,
             expression,
             docs,
             constant: None,
@@ -922,11 +929,13 @@ impl ObjectTree {
         ty: NodeIndex,
         name: &str,
         location: Location,
+        end_location: Location,
         docs: DocCollection,
         expression: Expression,
     ) -> &mut TypeVar {
         self.insert_var(ty, name, VarValue {
             location,
+            end_location,
             expression: Some(expression),
             docs,
             constant: None,
@@ -937,6 +946,7 @@ impl ObjectTree {
     fn get_from_path<'a, I: Iterator<Item=&'a str>>(
         &mut self,
         location: Location,
+        end_location: Location,
         mut path: I,
         len: usize,
     ) -> Result<(NodeIndex, &'a str), DMError> {
@@ -949,7 +959,7 @@ impl ObjectTree {
             return Ok((current, last));
         }
         for each in path {
-            current = self.subtype_or_add(location, current, last, len);
+            current = self.subtype_or_add(location, end_location, current, last, len);
             last = each;
             if is_decl(last) {
                 break;
@@ -962,6 +972,7 @@ impl ObjectTree {
     fn register_var<'a, I>(
         &mut self,
         location: Location,
+        end_location: Location,
         parent: NodeIndex,
         mut prev: &'a str,
         mut rest: I,
@@ -1010,6 +1021,7 @@ impl ObjectTree {
         Ok(Some(node.vars.entry(prev.to_owned()).or_insert_with(|| TypeVar {
             value: VarValue {
                 location,
+                end_location,
                 expression: suffix.into_initializer(),
                 constant: None,
                 being_evaluated: false,
@@ -1031,6 +1043,7 @@ impl ObjectTree {
         &mut self,
         context: &Context,
         location: Location,
+        end_location: Location,
         parent: NodeIndex,
         name: &str,
         declaration: Option<ProcDeclKind>,
@@ -1057,6 +1070,7 @@ impl ObjectTree {
 
         let value = ProcValue {
             location,
+            end_location,
             parameters,
             docs: Default::default(),
             code
@@ -1095,6 +1109,7 @@ impl ObjectTree {
     ) -> Result<(), DMError> {
         self.add_entry(
             Location::builtins(),
+            Location::builtins(),
             elems.iter().cloned(),
             elems.len() + 1,
             Default::default(),
@@ -1107,20 +1122,21 @@ impl ObjectTree {
     fn add_entry<'a, I: Iterator<Item = &'a str>>(
         &mut self,
         location: Location,
+        end_location: Location,
         mut path: I,
         len: usize,
         comment: DocCollection,
         suffix: VarSuffix,
     ) -> Result<EntryType, DMError> {
-        let (parent, child) = self.get_from_path(location, &mut path, len)?;
+        let (parent, child) = self.get_from_path(location, end_location, &mut path, len)?;
         if is_var_decl(child) {
-            self.register_var(location, parent, "var", path, comment, suffix)?;
+            self.register_var(location, end_location, parent, "var", path, comment, suffix)?;
             Ok(EntryType::VarDecl)
         } else if is_proc_decl(child) {
             Ok(EntryType::ProcDecl)
             // proc{} block, children will be procs
         } else {
-            let idx = self.subtype_or_add(location, parent, child, len);
+            let idx = self.subtype_or_add(location, end_location, parent, child, len);
             self[idx].docs.extend(comment);
             Ok(EntryType::Subtype)
         }
@@ -1132,6 +1148,7 @@ impl ObjectTree {
         value: Expression,
     ) -> Result<(), DMError> {
         self.add_var(
+            Location::builtins(),
             Location::builtins(),
             elems.iter().copied(),
             elems.len() + 1,
@@ -1145,14 +1162,15 @@ impl ObjectTree {
     fn add_var<'a, I: Iterator<Item = &'a str>>(
         &mut self,
         location: Location,
+        end_location: Location,
         mut path: I,
         len: usize,
         expr: Expression,
         comment: DocCollection,
         suffix: VarSuffix,
     ) -> Result<(), DMError> {
-        let (parent, initial) = self.get_from_path(location, &mut path, len)?;
-        if let Some(type_var) = self.register_var(location, parent, initial, path, comment, suffix)? {
+        let (parent, initial) = self.get_from_path(location, end_location, &mut path, len)?;
+        if let Some(type_var) = self.register_var(location, end_location, parent, initial, path, comment, suffix)? {
             type_var.value.location = location;
             type_var.value.expression = Some(expr);
             Ok(())
@@ -1169,6 +1187,7 @@ impl ObjectTree {
         self.add_proc(
             &Default::default(),
             Location::builtins(),
+            Location::builtins(),
             elems.iter().copied(),
             elems.len() + 1,
             params.iter().copied().map(|param| Parameter { name: param.into(), .. Default::default() }).collect(),
@@ -1182,12 +1201,13 @@ impl ObjectTree {
         &mut self,
         context: &Context,
         location: Location,
+        end_location: Location,
         mut path: I,
         len: usize,
         parameters: Vec<Parameter>,
         code: Code,
     ) -> Result<(usize, &mut ProcValue), DMError> {
-        let (parent, mut proc_name) = self.get_from_path(location, &mut path, len)?;
+        let (parent, mut proc_name) = self.get_from_path(location, end_location, &mut path, len)?;
         let mut declaration = None;
         if let Some(kind) = ProcDeclKind::from_name(proc_name) {
             declaration = Some(kind);
@@ -1205,7 +1225,7 @@ impl ObjectTree {
             ));
         }
 
-        self.register_proc(context, location, parent, proc_name, declaration, parameters, code)
+        self.register_proc(context, location, end_location, parent, proc_name, declaration, parameters, code)
     }
 
     /// Drop all code ASTs to attempt to reduce memory usage.

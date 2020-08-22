@@ -13,6 +13,7 @@ use crate::error::Location;
 pub struct Spanned<T> {
     // TODO: add a Span type and use it here
     pub location: Location,
+    pub end_location: Location,
     pub elem: T,
 }
 
@@ -24,8 +25,8 @@ impl<T: PartialEq> PartialEq for Spanned<T> {
 }
 
 impl<T> Spanned<T> {
-    pub fn new(location: Location, elem: T) -> Spanned<T> {
-        Spanned { location, elem }
+    pub fn new(location: Location, end_location: Location, elem: T) -> Spanned<T> {
+        Spanned { location, end_location, elem }
     }
 }
 
@@ -484,7 +485,7 @@ impl From<Term> for Expression {
             term => Expression::Base {
                 unary: vec![],
                 follow: vec![],
-                term: Spanned::new(Default::default(), term),
+                term: Spanned::new(Default::default(), Default::default(), term),
             },
         }
     }
@@ -741,6 +742,7 @@ pub struct Parameter {
     pub input_type: InputType,
     pub in_list: Option<Expression>,
     pub location: Location,
+    pub end_location: Location
 }
 
 impl fmt::Display for Parameter {

@@ -1,6 +1,7 @@
 //! The symbol table used for "Find References" support.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use dm::Location;
 use dm::objtree::*;
@@ -13,8 +14,8 @@ pub struct ReferencesTable {
 
 #[derive(Default)]
 struct References {
-    references: Vec<Location>,
-    implementations: Vec<Location>,
+    references: Vec<Range<Location>>,
+    implementations: Vec<Range<Location>>,
 }
 
 impl ReferencesTable {
@@ -27,17 +28,17 @@ impl ReferencesTable {
         // Insert the "definition" locations for the types and such
         objtree.root().recurse(&mut |ty| {
             tab.uses.insert(ty.id, References {
-                references: vec![ty.location],
+                references: vec![Range { start: ty.location, end: ty.end_location }],
                 implementations: vec![],
             });
             for (name, var) in ty.vars.iter() {
                 if let Some(decl) = ty.get_var_declaration(name) {
-                    tab.impl_symbol(decl.id, var.value.location);
+                    tab.impl_symbol(decl.id, var.value.location, var.value.end_location);
                 }
             }
             for (name, proc) in ty.procs.iter() {
                 if let Some(decl) = ty.get_proc_declaration(name) {
-                    tab.impl_symbol(decl.id, proc.value.first().unwrap().location);
+                    tab.impl_symbol(decl.id, proc.value.first().unwrap().location, proc.value.first().unwrap().end_location);
                 }
             }
         });
@@ -63,42 +64,42 @@ impl ReferencesTable {
 
         // Sublime Text client does not sort these itself, so sort them here.
         for value in tab.uses.values_mut() {
-            value.references.sort();
-            value.implementations.sort();
+            value.references.sort_by(|a, b| b.start.cmp(&a.start));
+            value.implementations.sort_by(|a, b| b.start.cmp(&a.start));
         }
 
         tab
     }
 
-    pub fn find_references(&self, symbol: SymbolId, _declaration: bool) -> &[Location] {
+    pub fn find_references(&self, symbol: SymbolId, _declaration: bool) -> &[Range<Location>] {
         match self.uses.get(&symbol) {
             None => &[],
             Some(list) => &list.references,
         }
     }
 
-    pub fn find_implementations(&self, symbol: SymbolId) -> &[Location] {
+    pub fn find_implementations(&self, symbol: SymbolId) -> &[Range<Location>] {
         match self.uses.get(&symbol) {
             None => &[],
             Some(list) => &list.implementations,
         }
     }
 
-    fn new_symbol(&mut self, location: Location) -> SymbolId {
+    fn new_symbol(&mut self, start: Location, end: Location) -> SymbolId {
         let id = self.symbols.allocate();
         self.uses.insert(id, References {
-            references: vec![location],
+            references: vec![Range { start, end }],
             implementations: vec![],
         });
         id
     }
 
-    fn use_symbol(&mut self, symbol: SymbolId, location: Location) {
-        self.uses.entry(symbol).or_default().references.push(location);
+    fn use_symbol(&mut self, symbol: SymbolId, start: Location, end: Location) {
+        self.uses.entry(symbol).or_default().references.push(Range { start, end });
     }
 
-    fn impl_symbol(&mut self, symbol: SymbolId, location: Location) {
-        self.uses.entry(symbol).or_default().implementations.push(location);
+    fn impl_symbol(&mut self, symbol: SymbolId, start: Location, end: Location) {
+        self.uses.entry(symbol).or_default().implementations.push(Range { start, end });
     }
 }
 
@@ -144,22 +145,22 @@ impl<'o> WalkProc<'o> {
         });
         local_vars.insert(".".to_owned(), Local {
             ty: StaticType::None,
-            symbol: tab.new_symbol(proc.location),
+            symbol: tab.new_symbol(proc.location, proc.end_location),
         });
         local_vars.insert("args".to_owned(), Local {
             ty: StaticType::Type(objtree.expect("/list")),
-            symbol: tab.new_symbol(proc.location),
+            symbol: tab.new_symbol(proc.location, proc.end_location),
         });
         local_vars.insert("usr".to_owned(), Local {
             ty: StaticType::Type(objtree.expect("/mob")),
-            symbol: tab.new_symbol(proc.location),
+            symbol: tab.new_symbol(proc.location, proc.end_location),
         });
 
         let ty = proc.ty();
         if !ty.is_root() {
             local_vars.insert("src".to_owned(), Local {
                 ty: StaticType::Type(ty),
-                symbol: tab.new_symbol(proc.location),
+                symbol: tab.new_symbol(proc.location, proc.end_location),
             });
         }
 
@@ -191,13 +192,13 @@ impl<'o> WalkProc<'o> {
     pub fn run(&mut self, proc: ProcRef<'o>, block: &'o [Spanned<Statement>]) {
         for param in proc.get().parameters.iter() {
             let ty = self.static_type(param.location, &param.var_type.type_path);
-            self.use_type(param.location, &ty);
+            self.use_type(param.location, param.end_location, &ty);
             if let Some(expr) = &param.default {
                 self.visit_expression(param.location, expr, None);
             }
             self.local_vars.insert(param.name.to_owned(), Local {
                 ty,
-                symbol: self.tab.new_symbol(param.location)
+                symbol: self.tab.new_symbol(param.location, param.end_location)
             });
         }
         self.visit_block(block);
@@ -205,16 +206,16 @@ impl<'o> WalkProc<'o> {
 
     fn visit_block(&mut self, block: &'o [Spanned<Statement>]) {
         for stmt in block.iter() {
-            self.visit_statement(stmt.location, &stmt.elem);
+            self.visit_statement(stmt.location, stmt.end_location, &stmt.elem);
         }
     }
 
-    fn visit_statement(&mut self, location: Location, statement: &'o Statement) {
+    fn visit_statement(&mut self, location: Location, end_location: Location, statement: &'o Statement) {
         match statement {
             Statement::Expr(expr) => { self.visit_expression(location, expr, None); },
             Statement::Return(expr) => {
                 let dot = self.local_vars.get(".").unwrap().symbol;
-                self.tab.use_symbol(dot, location);
+                self.tab.use_symbol(dot, location, end_location);
                 if let Some(expr) = expr {
                     self.visit_expression(location, expr, None);
                 }
@@ -239,13 +240,13 @@ impl<'o> WalkProc<'o> {
             },
             Statement::ForLoop { init, test, inc, block } => {
                 if let Some(init) = init {
-                    self.visit_statement(location, init);
+                    self.visit_statement(location, end_location, init);
                 }
                 if let Some(test) = test {
                     self.visit_expression(location, test, None);
                 }
                 if let Some(inc) = inc {
-                    self.visit_statement(location, inc);
+                    self.visit_statement(location, end_location, inc);
                 }
                 self.visit_block(block);
             },
@@ -254,7 +255,7 @@ impl<'o> WalkProc<'o> {
                     self.visit_expression(location, in_list, None);
                 }
                 if let Some(var_type) = var_type {
-                    self.visit_var(location, var_type, name, None);
+                    self.visit_var(location, end_location, var_type, name, None);
                 }
                 self.visit_block(block);
             },
@@ -264,14 +265,14 @@ impl<'o> WalkProc<'o> {
                     self.visit_expression(location, step, None);
                 }
                 if let Some(var_type) = var_type {
-                    self.visit_var(location, var_type, name, Some(start));
+                    self.visit_var(location, end_location, var_type, name, Some(start));
                 }
                 self.visit_block(block);
             },
-            Statement::Var(var) => self.visit_var_stmt(location, var),
+            Statement::Var(var) => self.visit_var_stmt(location, end_location, var),
             Statement::Vars(vars) => {
                 for each in vars.iter() {
-                    self.visit_var_stmt(location, each);
+                    self.visit_var_stmt(location, end_location, each);
                 }
             },
             Statement::Setting { .. } => {},
@@ -311,7 +312,7 @@ impl<'o> WalkProc<'o> {
                         _ => {}
                     }
                     let var_type: VarType = type_path.iter().map(ToOwned::to_owned).collect();
-                    self.visit_var(location, &var_type, var_name, None);
+                    self.visit_var(location, end_location, &var_type, var_name, None);
                 }
                 self.visit_block(catch_block);
             },
@@ -324,29 +325,29 @@ impl<'o> WalkProc<'o> {
         }
     }
 
-    fn visit_var_stmt(&mut self, location: Location, var: &'o VarStatement) {
-        self.visit_var(location, &var.var_type, &var.name, var.value.as_ref())
+    fn visit_var_stmt(&mut self, location: Location, end_location: Location, var: &'o VarStatement) {
+        self.visit_var(location, end_location, &var.var_type, &var.name, var.value.as_ref())
     }
 
-    fn visit_var(&mut self, location: Location, var_type: &VarType, name: &str, value: Option<&'o Expression>) {
+    fn visit_var(&mut self, location: Location, end_location: Location, var_type: &VarType, name: &str, value: Option<&'o Expression>) {
         let ty = self.static_type(location, &var_type.type_path);
-        self.use_type(location, &ty);
+        self.use_type(location, end_location, &ty);
         if let Some(ref expr) = value {
             self.visit_expression(location, expr, ty.basic_type());
         }
         self.local_vars.insert(name.to_owned(), Local {
             ty,
-            symbol: self.tab.new_symbol(location),
+            symbol: self.tab.new_symbol(location, end_location),
         });
     }
 
-    fn use_type(&mut self, location: Location, ty: &StaticType<'o>) {
+    fn use_type(&mut self, location: Location, end_location: Location, ty: &StaticType<'o>) {
         match ty {
             StaticType::None => {},
-            StaticType::Type(ty) => self.tab.use_symbol(ty.id, location),
+            StaticType::Type(ty) => self.tab.use_symbol(ty.id, location, end_location),
             StaticType::List { list, keys } => {
-                self.tab.use_symbol(list.id, location);
-                self.use_type(location, keys);
+                self.tab.use_symbol(list.id, location, end_location);
+                self.use_type(location, end_location, keys);
             }
         }
     }
@@ -359,9 +360,9 @@ impl<'o> WalkProc<'o> {
                 } else {
                     None
                 };
-                let mut ty = self.visit_term(term.location, &term.elem, base_type_hint);
+                let mut ty = self.visit_term(term.location, term.end_location, &term.elem, base_type_hint);
                 for each in follow.iter() {
-                    ty = self.visit_follow(each.location, ty, &each.elem);
+                    ty = self.visit_follow(each.location, each.end_location, ty, &each.elem);
                 }
                 for each in unary.iter().rev() {
                     ty = self.visit_unary(ty, *each);
@@ -395,7 +396,7 @@ impl<'o> WalkProc<'o> {
         }
     }
 
-    fn visit_term(&mut self, location: Location, term: &'o Term, type_hint: Option<TypeRef<'o>>) -> StaticType<'o> {
+    fn visit_term(&mut self, location: Location, end_location: Location, term: &'o Term, type_hint: Option<TypeRef<'o>>) -> StaticType<'o> {
         match term {
             Term::Null => StaticType::None,
             Term::Int(_) => StaticType::None,
@@ -406,7 +407,7 @@ impl<'o> WalkProc<'o> {
 
             Term::Expr(expr) => self.visit_expression(location, expr, type_hint),
             Term::Prefab(prefab) => {
-                self.visit_prefab(location, prefab);
+                self.visit_prefab(location, end_location, prefab);
                 StaticType::None
             },
             Term::InterpString(_, parts) => {
@@ -420,11 +421,11 @@ impl<'o> WalkProc<'o> {
 
             Term::Ident(unscoped_name) => {
                 if let Some(var) = self.local_vars.get(unscoped_name) {
-                    self.tab.use_symbol(var.symbol, location);
+                    self.tab.use_symbol(var.symbol, location, end_location);
                     return var.ty.clone();
                 }
                 if let Some(decl) = self.ty.get_var_declaration(unscoped_name) {
-                    self.tab.use_symbol(decl.id, location);
+                    self.tab.use_symbol(decl.id, location, end_location);
                     self.static_type(location, &decl.var_type.type_path)
                 } else {
                     StaticType::None
@@ -433,7 +434,7 @@ impl<'o> WalkProc<'o> {
             Term::Call(unscoped_name, args) => {
                 let src = self.ty;
                 if let Some(proc) = self.ty.get_proc(unscoped_name) {
-                    self.visit_call(location, src, proc, args, false)
+                    self.visit_call(location, end_location, src, proc, args, false)
                 } else {
                     StaticType::None
                 }
@@ -442,7 +443,7 @@ impl<'o> WalkProc<'o> {
                 if let Some(proc) = self.proc {
                     let src = self.ty;
                     // Self calls are exact, and won't ever call an override.
-                    self.visit_call(location, src, proc, args, true)
+                    self.visit_call(location, end_location, src, proc, args, true)
                 } else {
                     StaticType::None
                 }
@@ -452,7 +453,7 @@ impl<'o> WalkProc<'o> {
                     // TODO: if args are empty, call w/ same args
                     let src = self.ty;
                     // Parent calls are exact, and won't ever call an override.
-                    self.visit_call(location, src, proc, args, true)
+                    self.visit_call(location, end_location, src, proc, args, true)
                 } else {
                     StaticType::None
                 }
@@ -467,7 +468,7 @@ impl<'o> WalkProc<'o> {
                     } else {
                         None
                     },
-                    NewType::Prefab(prefab) => self.visit_prefab(location, prefab),
+                    NewType::Prefab(prefab) => self.visit_prefab(location, end_location, prefab),
                     NewType::MiniExpr { .. } => None,  // TODO: evaluate
                 };
 
@@ -476,6 +477,7 @@ impl<'o> WalkProc<'o> {
                     if let Some(new_proc) = typepath.get_proc("New") {
                         self.visit_call(
                             location,
+                            end_location,
                             typepath,
                             new_proc,
                             args.as_ref().map_or(&[], |v| &v[..]),
@@ -533,21 +535,21 @@ impl<'o> WalkProc<'o> {
         }
     }
 
-    fn visit_prefab(&mut self, location: Location, prefab: &'o Prefab) -> Option<TypeRef<'o>> {
+    fn visit_prefab(&mut self, location: Location, end_location: Location, prefab: &'o Prefab) -> Option<TypeRef<'o>> {
         if let Some(nav) = self.ty.navigate_path(&prefab.path) {
             // Use the proc if there was one of those
             if let NavigatePathResult::ProcPath(proc, _) = nav {
                 if let Some(decl) = nav.ty().get_proc_declaration(proc.name()) {
-                    self.tab.use_symbol(decl.id, location);
+                    self.tab.use_symbol(decl.id, location, end_location);
                 }
             } else {
                 // Use the type
-                self.tab.use_symbol(nav.ty().id, location);
+                self.tab.use_symbol(nav.ty().id, location, end_location);
                 // Use the prefab's vars
                 for (key, expr) in prefab.vars.iter() {
                     let mut type_hint = None;
                     if let Some(decl) = nav.ty().get_var_declaration(key) {
-                        self.tab.use_symbol(decl.id, location);
+                        self.tab.use_symbol(decl.id, location, end_location);
                         type_hint = self.static_type(location, &decl.var_type.type_path).basic_type();
                     }
                     self.visit_expression(location, expr, type_hint);
@@ -559,7 +561,7 @@ impl<'o> WalkProc<'o> {
         }
     }
 
-    fn visit_follow(&mut self, location: Location, lhs: StaticType<'o>, rhs: &'o Follow) -> StaticType<'o> {
+    fn visit_follow(&mut self, location: Location, end_location: Location, lhs: StaticType<'o>, rhs: &'o Follow) -> StaticType<'o> {
         match rhs {
             Follow::Index(expr) => {
                 self.visit_expression(location, expr, None);
@@ -573,7 +575,7 @@ impl<'o> WalkProc<'o> {
             Follow::Field(_, name) => {
                 if let Some(ty) = lhs.basic_type() {
                     if let Some(decl) = ty.get_var_declaration(name) {
-                        self.tab.use_symbol(decl.id, location);
+                        self.tab.use_symbol(decl.id, location, end_location);
                         self.static_type(location, &decl.var_type.type_path)
                     } else {
                         StaticType::None
@@ -585,7 +587,7 @@ impl<'o> WalkProc<'o> {
             Follow::Call(_, name, arguments) => {
                 if let Some(ty) = lhs.basic_type() {
                     if let Some(proc) = ty.get_proc(name) {
-                        self.visit_call(location, ty, proc, arguments, false)
+                        self.visit_call(location, end_location, ty, proc, arguments, false)
                     } else {
                         self.visit_arguments(location, arguments);
                         StaticType::None
@@ -608,10 +610,10 @@ impl<'o> WalkProc<'o> {
         StaticType::None
     }
 
-    fn visit_call(&mut self, location: Location, src: TypeRef<'o>, proc: ProcRef, args: &'o [Expression], _is_exact: bool) -> StaticType<'o> {
+    fn visit_call(&mut self, location: Location, end_location: Location, src: TypeRef<'o>, proc: ProcRef, args: &'o [Expression], _is_exact: bool) -> StaticType<'o> {
         // register use of symbol
         if let Some(decl) = src.get_proc_declaration(proc.name()) {
-            self.tab.use_symbol(decl.id, location);
+            self.tab.use_symbol(decl.id, location, end_location);
         }
 
         // identify and register kwargs used

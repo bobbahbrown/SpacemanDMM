@@ -244,6 +244,13 @@ impl<'a> Engine<'a> {
         })
     }
 
+    fn convert_range(&self, range: &std::ops::Range<dm::Location>) -> Result<lsp_types::Range, jsonrpc::Error> {
+        Ok(lsp_types::Range::new(
+            location_to_position(range.start),
+            location_to_position(range.end)
+        ))
+    }
+
     // ------------------------------------------------------------------------
     // Object tree explorer
 
@@ -1438,7 +1445,7 @@ handle_method_call! {
         } else {
             let mut output = Vec::new();
             for each in result {
-                output.push(self.convert_location(*each, &[])?);
+                output.push(self.convert_location(each.start, &[])?);
             }
             Some(output)
         }
@@ -1459,7 +1466,7 @@ handle_method_call! {
         } else {
             let mut output = Vec::new();
             for each in result {
-                output.push(self.convert_location(*each, &[])?);
+                output.push(self.convert_location(each.start, &[])?);
             }
             Some(GotoDefinitionResponse::Array(output))
         }
@@ -1774,10 +1781,11 @@ handle_method_call! {
     on Rename(&mut self, params) {
         let symbol_id = self.symbol_id_at(params.text_document_position)?;
 
-        let mut result = &[][..];
+        let mut result = Vec::new();
         if let Some(id) = symbol_id {
             if let Some(ref table) = self.references_table {
-                result = table.find_references(id, true);
+                result.extend_from_slice(table.find_references(id, false));
+                result.extend_from_slice(table.find_implementations(id));
             }
         }
         if result.is_empty() {
@@ -1785,9 +1793,9 @@ handle_method_call! {
         } else {
             let mut output: HashMap<Url, Vec<TextEdit>> = HashMap::new();
             for each in result {
-                if !each.is_builtins() {
-                    let loc_record = self.convert_location(*each, &[])?;
-                    output.entry(loc_record.uri).or_insert(Vec::new()).push(TextEdit::new(loc_record.range, params.new_name.clone()));
+                if !each.start.is_builtins() {
+                    let loc_record = self.convert_location(each.start, &[])?;
+                    output.entry(loc_record.uri).or_insert(Vec::new()).push(TextEdit::new(self.convert_range(&each)?, params.new_name.clone()));
                 }
             }
             Some(WorkspaceEdit::new(output))
