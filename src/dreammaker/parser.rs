@@ -292,7 +292,9 @@ pub struct Parser<'ctx, 'an, 'inp> {
     possible_indentation_error: bool,
     next: Option<Token>,
     location: Location,
+    last_location: Location,
     end_location: Location,
+    last_end: Location,
     expected: Vec<Cow<'static, str>>,
 
     docs_following: DocCollection,
@@ -324,8 +326,12 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             eof: false,
             possible_indentation_error: false,
             next: None,
+
             location: Default::default(),
+            last_location: Default::default(),
             end_location: Default::default(),
+            last_end: Default::default(),
+
             expected: Vec::new(),
 
             docs_following: Default::default(),
@@ -467,6 +473,8 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 },
                 Some(token) => {
                     self.expected.clear();
+                    self.last_location = self.location;
+                    self.last_end = self.end_location;
                     self.location = token.location;
 
                     if let Token::Eof = token.token {
@@ -803,8 +811,8 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             }
             Punct(Assign) => {
                 // `something=` - var
-                let location = self.location;
-                let end_location = self.end_location;
+                let location = self.last_location;
+                let end_location = self.last_end;
                 // kind of goofy, but allows "enclosing" doc comments at the end of the line
                 let (docs, expression) = require!(self.doc_comment(|this| {
                     let expr = require!(this.expression());
@@ -850,7 +858,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                         var_type.suffix(&var_suffix);
                         let node = self.tree[current].path.to_owned();
                         self.annotate(entry_start, || Annotation::Variable(reconstruct_path(&node, proc_kind, Some(&var_type), last_part)));
-                        self.tree.declare_var(current, last_part, self.location, self.end_location, docs, var_type, var_suffix.into_initializer());
+                        self.tree.declare_var(current, last_part, self.last_location, self.last_end, docs, var_type, var_suffix.into_initializer());
                     }
                 } else if ProcDeclKind::from_name(last_part).is_some() {
                     self.error("`proc;` item has no effect")
@@ -953,8 +961,8 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
         leading!(self.exact(Punct(LParen)));
 
-        let location = self.location;
-        let end_location = self.end_location;
+        let location = self.last_location;
+        let end_location = self.last_end;
         let parameters = require!(self.separated(Comma, RParen, None, Parser::proc_parameter));
 
         // split off a subparser so we can keep parsing the objtree

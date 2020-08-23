@@ -50,6 +50,7 @@ pub type Vars = LinkedHashMap<String, Constant>;
 pub struct VarDeclaration {
     pub var_type: VarType,
     pub location: Location,
+    pub end_location: Location,
     pub id: SymbolId,
 }
 
@@ -74,6 +75,7 @@ pub struct TypeVar {
 #[derive(Debug, Clone)]
 pub struct ProcDeclaration {
     pub location: Location,
+    pub end_location: Location,
     pub kind: ProcDeclKind,
     pub id: SymbolId,
     pub is_private: bool,
@@ -920,6 +922,7 @@ impl ObjectTree {
         }, Some(VarDeclaration {
             var_type,
             location,
+            end_location,
             id,
         }))
     }
@@ -1031,6 +1034,7 @@ impl ObjectTree {
                 Some(VarDeclaration {
                     var_type,
                     location,
+                    end_location,
                     id: symbols.allocate(),
                 })
             } else {
@@ -1060,6 +1064,7 @@ impl ObjectTree {
             } else {
                 proc.declaration = Some(ProcDeclaration {
                     location,
+                    end_location,
                     kind,
                     id: self.symbols.allocate(),
                     is_private: false,
