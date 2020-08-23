@@ -31,14 +31,15 @@ impl ReferencesTable {
                 references: vec![Range { start: ty.location, end: ty.end_location }],
                 implementations: vec![],
             });
-            for (name, _var) in ty.vars.iter() {
+            for (name, var) in ty.vars.iter() {
                 if let Some(decl) = ty.get_var_declaration(name) {
-                    tab.impl_symbol(decl.id, decl.location, decl.end_location);
+                    tab.impl_symbol(decl.id, var.value.location, var.value.end_location);
                 }
             }
-            for (name, _proc) in ty.procs.iter() {
+            for (name, proc) in ty.procs.iter() {
                 if let Some(decl) = ty.get_proc_declaration(name) {
-                    tab.impl_symbol(decl.id, decl.location, decl.end_location);
+                    let first_procval = proc.value.first().unwrap();
+                    tab.impl_symbol(decl.id, first_procval.location, first_procval.end_location);
                 }
             }
         });
