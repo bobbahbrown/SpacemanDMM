@@ -2164,7 +2164,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 Follow::Field(kind, ident)
             },
         };
-        success(Spanned::new(first_location, self.end_location, follow))
+        success(Spanned::new(start, end, follow))
     }
 
     // TODO: somehow fix the fact that this is basically copy-pasted from
