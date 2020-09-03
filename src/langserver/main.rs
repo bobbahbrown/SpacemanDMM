@@ -1444,8 +1444,8 @@ handle_method_call! {
             None
         } else {
             let mut output = Vec::new();
-            for each in result {
-                output.push(self.convert_location(each.start, &[])?);
+            for each in result.iter().filter(|&reference| reference.by_name) {
+                output.push(self.convert_location(each.location.start, &[])?);
             }
             Some(output)
         }
@@ -1784,7 +1784,7 @@ handle_method_call! {
         let mut result = Vec::new();
         if let Some(id) = symbol_id {
             if let Some(ref table) = self.references_table {
-                result.extend_from_slice(table.find_references(id, false));
+                result.extend(table.find_references(id, false).iter().filter(|&reference| reference.by_name).map(|reference| reference.location.clone()));
                 result.extend_from_slice(table.find_implementations(id));
             }
         }
