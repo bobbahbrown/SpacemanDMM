@@ -18,6 +18,7 @@ struct References {
     implementations: Vec<Range<Location>>,
 }
 
+#[derive(Clone)]
 pub struct Reference {
     pub location: Range<Location>,
     pub by_name: bool

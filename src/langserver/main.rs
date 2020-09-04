@@ -723,14 +723,14 @@ impl<'a> Engine<'a> {
         next
     }
 
-    fn symbol_id_at(&mut self, text_document_position: lsp_types::TextDocumentPositionParams) -> Result<Option<dm::objtree::SymbolId>, jsonrpc::Error> {
+    fn symbol_id_at(&mut self, text_document_position: &lsp_types::TextDocumentPositionParams) -> Result<Option<dm::objtree::SymbolId>, jsonrpc::Error> {
         let (_, file_id, annotations) = self.get_annotations(&text_document_position.text_document.uri)?;
+
         let location = dm::Location {
             file: file_id,
             line: text_document_position.position.line as u32 + 1,
             column: text_document_position.position.character as u16 + 1,
         };
-
         let mut symbol_id = None;
 
         let iter = annotations.get_location(location);
@@ -1007,7 +1007,7 @@ handle_method_call! {
                 }),
                 color_provider: Some(ColorProviderCapability::Simple(true)),
                 rename_provider: Some(RenameProviderCapability::Options(RenameOptions {
-                    prepare_provider: Some(false),
+                    prepare_provider: Some(true),
                     work_done_progress_options: Default::default()
                 })),
                 .. Default::default()
@@ -1432,7 +1432,7 @@ handle_method_call! {
 
     on References(&mut self, params) {
         // Like GotoDefinition, but looks up references instead
-        let symbol_id = self.symbol_id_at(params.text_document_position)?;
+        let symbol_id = self.symbol_id_at(&params.text_document_position)?;
 
         let mut result = &[][..];
         if let Some(id) = symbol_id {
@@ -1453,7 +1453,7 @@ handle_method_call! {
 
     on GotoImplementation(&mut self, params) {
         let tdp = params.text_document_position_params;
-        let symbol_id = self.symbol_id_at(tdp)?;
+        let symbol_id = self.symbol_id_at(&tdp)?;
 
         let mut result = &[][..];
         if let Some(id) = symbol_id {
@@ -1775,11 +1775,34 @@ handle_method_call! {
         ]
     }
 
-    // need to fix range to make sure it selects the whole term,
-    // also need to make sure we are selecting the original location where the
-    // symbol appears -- right now it inserts instead of overwriting and not at the selected site
+    on PrepareRenameRequest(&mut self, params) {
+        let (_, file_id, _annotations) = self.get_annotations(&params.text_document.uri)?;
+        let location = dm::Location {
+            file: file_id,
+            line: params.position.line as u32 + 1,
+            column: params.position.character as u16 + 1,
+        };
+        let symbol_id = self.symbol_id_at(&params)?;
+
+        let mut result = Vec::new();
+        if let Some(id) = symbol_id {
+            if let Some(ref table) = self.references_table {
+                result.extend(table.find_references(id, true).iter().filter(|&reference| reference.location.contains(&location)).map(|reference| reference.location.clone()));
+                result.extend_from_slice(table.find_implementations(id));
+            }
+        }
+
+        if result.len() > 0 {
+            let this_ref = &result[0];
+            Some(lsp_types::PrepareRenameResponse::Range(self.convert_range(this_ref)?))
+        }
+        else {
+            return Err(invalid_request("Cannot find symbol to rename."));
+        }
+    }
+
     on Rename(&mut self, params) {
-        let symbol_id = self.symbol_id_at(params.text_document_position)?;
+        let symbol_id = self.symbol_id_at(&params.text_document_position)?;
 
         let mut result = Vec::new();
         if let Some(id) = symbol_id {
