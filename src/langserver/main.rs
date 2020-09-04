@@ -1794,6 +1794,9 @@ handle_method_call! {
 
         if result.len() > 0 {
             let this_ref = &result[0];
+            if this_ref.start.is_builtins() {
+                return Err(invalid_request("Cannot rename BYOND built-ins."));
+            }
             Some(lsp_types::PrepareRenameResponse::Range(self.convert_range(this_ref)?))
         }
         else {
