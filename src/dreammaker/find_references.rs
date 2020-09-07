@@ -1,10 +1,10 @@
 //! The symbol table used for "Find References" support.
 
 use std::collections::HashMap;
+use crate::Location;
+use crate::objtree::*;
+use crate::ast::*;
 
-use dm::Location;
-use dm::objtree::*;
-use dm::ast::*;
 
 pub struct ReferencesTable {
     uses: HashMap<SymbolId, References>,
@@ -55,7 +55,7 @@ impl ReferencesTable {
             }
 
             for proc in ty.iter_self_procs() {
-                if let dm::objtree::Code::Present(ref code) = proc.code {
+                if let crate::objtree::Code::Present(ref code) = proc.code {
                     WalkProc::from_proc(&mut tab, objtree, proc).run(proc, code);
                 }
             }
@@ -286,8 +286,8 @@ impl<'o> WalkProc<'o> {
                 for (case, ref block) in cases.iter() {
                     for case_part in case.elem.iter() {
                         match case_part {
-                            dm::ast::Case::Exact(expr) => { self.visit_expression(case.location, expr, None); },
-                            dm::ast::Case::Range(start, end) => {
+                            crate::ast::Case::Exact(expr) => { self.visit_expression(case.location, expr, None); },
+                            crate::ast::Case::Range(start, end) => {
                                 self.visit_expression(case.location, start, None);
                                 self.visit_expression(case.location, end, None);
                             }
@@ -463,12 +463,24 @@ impl<'o> WalkProc<'o> {
                 // determine the type being new'd
                 let typepath = match type_ {
                     NewType::Implicit => if let Some(hint) = type_hint {
+                        self.tab.use_symbol(hint.id, location);
                         Some(hint)
                     } else {
                         None
                     },
                     NewType::Prefab(prefab) => self.visit_prefab(location, prefab),
-                    NewType::MiniExpr { .. } => None,  // TODO: evaluate
+                    NewType::MiniExpr { ident, fields: _ } => {
+                        if let Some(nav) = self.ty.get_var_declaration(ident) {
+                            if let Some(act_ty) = self.ty.tree().type_by_path(&nav.var_type.type_path) {
+                                self.tab.use_symbol(act_ty.id, location);
+                                Some(act_ty)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
                 };
 
                 // call to the New() method

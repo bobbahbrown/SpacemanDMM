@@ -25,7 +25,6 @@ extern crate regex;
 mod jrpc_io;
 mod document;
 mod symbol_search;
-mod find_references;
 mod extras;
 mod completion;
 mod color;
@@ -45,6 +44,7 @@ use lsp_types::MessageType;
 use dm::FileId;
 use dm::annotation::{Annotation, AnnotationTree};
 use dm::objtree::TypeRef;
+use dm::find_references::*;
 
 fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
@@ -150,7 +150,7 @@ struct Engine<'a> {
     context: &'a dm::Context,
     defines: Option<dm::preprocessor::DefineHistory>,
     objtree: Arc<dm::objtree::ObjectTree>,
-    references_table: Option<find_references::ReferencesTable>,
+    references_table: Option<ReferencesTable>,
 
     annotations: HashMap<Url, (FileId, FileId, Rc<AnnotationTree>)>,
     diagnostics_set: HashSet<Url>,
@@ -369,7 +369,7 @@ impl<'a> Engine<'a> {
             eprint!(" - object tree {}.{:03}s", elapsed.as_secs(), elapsed.subsec_millis());
         }
 
-        self.references_table = Some(find_references::ReferencesTable::new(&self.objtree));
+        self.references_table = Some(ReferencesTable::new(&self.objtree));
         let elapsed = start.elapsed(); start += elapsed;
         eprint!(" - references {}.{:03}s", elapsed.as_secs(), elapsed.subsec_millis());
 

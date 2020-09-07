@@ -5,9 +5,10 @@
 
 extern crate dreammaker as dm;
 use dm::{Context, DMError, Location, Severity};
-use dm::objtree::{ObjectTree, TypeRef, ProcRef, Code};
+use dm::objtree::{ObjectTree, TypeRef, ProcRef, Code, SymbolId};
 use dm::constants::{Constant, ConstFn};
 use dm::ast::*;
+use dm::find_references::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -901,6 +902,9 @@ fn error<S: Into<String>>(location: Location, desc: S) -> DMError {
 
 /// Examines an ObjectTree for var definitions that are invalid
 pub fn check_var_defs(objtree: &ObjectTree, context: &Context) {
+    let refs_table = ReferencesTable::new(objtree);
+    let mut found_issues : HashMap<SymbolId, DMError> = HashMap::new();
+
     for typeref in objtree.iter_types() {
         let path = &typeref.path;
 
@@ -949,8 +953,21 @@ pub fn check_var_defs(objtree: &ObjectTree, context: &Context) {
                         .with_note(decl.location, format!("declared private on {} here", parent.path))
                         .register(context);
                 }
+
+                if refs_table.find_references(decl.id, true).len() == 0 {
+                    found_issues.entry(decl.id)
+                        .or_insert({
+                            let err = DMError::new(decl.location, format!("{:?} is defined but never referenced", varname)).set_severity(Severity::Warning);
+                            err
+                        })
+                        .add_note(typevar.value.location, format!("implemented on {} here", path));
+                }
             }
         }
+    }
+
+    for (id, issue) in found_issues.drain() {
+        issue.register(context);
     }
 }
 
@@ -1701,7 +1718,29 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                             None
                         }
                     },
-                    NewType::MiniExpr { .. } => None,  // TODO: evaluate
+                    NewType::MiniExpr { ident, fields } => {
+                        // Note that this is unable to resolve locally declared vars at this time
+                        let mut return_type : Option<TypeRef> = None;
+                        if let Some(nav) = self.ty.get_var_declaration(ident) {
+                            if let Some(act_ty) = self.ty.tree().type_by_path(&nav.var_type.type_path) {
+                                // Check if we were unable to determine a type, and see if we can determine
+                                // a type use from a defined literal value
+                                if !act_ty.is_root() {
+                                    return_type = Some(act_ty)
+                                } else if let Some(val) = self.ty.get_value(ident) {
+                                    if let Some(constant) = &val.constant {
+                                        if let Some(lit_type) = self.ty.tree().type_by_constant(constant) {
+                                            return_type = Some(lit_type);
+                                        }
+                                    }
+                                }
+                            } else {
+                                error(location, format!("failed to resolve type {:?} to symbol {}", nav.var_type.type_path, ident))
+                                    .register(self.context);
+                            }
+                        }
+                        return_type
+                    }
                 };
 
                 // call to the New() method
@@ -1716,6 +1755,10 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                             // `/datum/New()` and never an override.
                             true,
                             local_vars);
+                    } else if typepath.is_root() {
+                        error(location, format!("Unable to infer type from var, try adding a typepath"))
+                            .set_severity(Severity::Warning)
+                            .register(self.context);
                     } else if typepath.path != "/list" {
                         error(location, format!("couldn't find {}/proc/New", typepath.path))
                             .register(self.context);
