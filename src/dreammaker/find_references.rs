@@ -470,16 +470,26 @@ impl<'o> WalkProc<'o> {
                     },
                     NewType::Prefab(prefab) => self.visit_prefab(location, prefab),
                     NewType::MiniExpr { ident, fields: _ } => {
+                        // Note that this is unable to resolve locally declared vars at this time
+                        let mut return_type : Option<TypeRef> = None;
                         if let Some(nav) = self.ty.get_var_declaration(ident) {
+                            self.tab.use_symbol(nav.id, location);
                             if let Some(act_ty) = self.ty.tree().type_by_path(&nav.var_type.type_path) {
-                                self.tab.use_symbol(act_ty.id, location);
-                                Some(act_ty)
-                            } else {
-                                None
+                                // Check if we were unable to determine a type, and see if we can determine
+                                // a type use from a defined literal value
+                                if !act_ty.is_root() {
+                                    return_type = Some(act_ty)
+                                } else if let Some(val) = self.ty.get_value(ident) {
+                                    self.visit_var(location, &nav.var_type, ident, val.expression.as_ref());
+                                    if let Some(constant) = &val.constant {
+                                        if let Some(lit_type) = self.ty.tree().type_by_constant(constant) {
+                                            return_type = Some(lit_type);
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            None
                         }
+                        return_type
                     }
                 };
 

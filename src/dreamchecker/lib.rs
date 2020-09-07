@@ -1728,6 +1728,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                                 if !act_ty.is_root() {
                                     return_type = Some(act_ty)
                                 } else if let Some(val) = self.ty.get_value(ident) {
+                                    self.visit_var(location, &nav.var_type, ident, val.expression.as_ref(), local_vars);
                                     if let Some(constant) = &val.constant {
                                         if let Some(lit_type) = self.ty.tree().type_by_constant(constant) {
                                             return_type = Some(lit_type);
