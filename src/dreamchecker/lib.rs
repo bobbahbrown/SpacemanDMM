@@ -954,7 +954,9 @@ pub fn check_var_defs(objtree: &ObjectTree, context: &Context) {
                         .register(context);
                 }
 
-                if refs_table.find_references(decl.id, true).len() == 0 {
+                // Check for unreferenced vars, exclude name as BYOND will use this var to
+                // transform a type into a string implicitly.
+                if refs_table.find_references(decl.id, true).len() == 0 && varname != "name" {
                     found_issues.entry(decl.id)
                         .or_insert({
                             let err = DMError::new(decl.location, format!("{:?} is defined but never referenced", varname)).set_severity(Severity::Warning);
