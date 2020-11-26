@@ -45,6 +45,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
     let mut environment = None;
     let mut output_path = "dmdoc".to_owned();
     let mut index_path = None;
+    let mut dry_run = false;
 
     let mut args = std::env::args();
     let _ = args.next();  // skip executable name
@@ -58,6 +59,8 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             output_path = args.next().expect("must specify a value for --output");
         } else if arg == "--index" {
             index_path = Some(args.next().expect("must specify a value for --index"));
+        } else if arg == "--dry-run" {
+            dry_run = true;
         } else {
             return Err(format!("unknown argument: {}", arg).into());
         }
@@ -71,8 +74,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
         None => match dm::detect_environment_default()? {
             Some(env) => env,
             None => {
-                eprintln!("Unable to find a .dme file in this directory");
-                return Ok(());
+                return Err("Unable to find a .dme file in this directory".into());
             }
         }
     };
@@ -133,39 +135,124 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut macro_to_module_map = BTreeMap::new();
-    for (range, (name, define)) in define_history.iter() {
-        if !define.docs().is_empty() {
-            macro_to_module_map.insert(name.clone(), module_path(&context.file_path(range.start.file)));
+    // collate modules which have docs
+    let mut modules1 = BTreeMap::new();
+    let mut macro_count = 0;
+    let mut macros_all = 0;
+    for (file, comment_vec) in module_docs {
+        let file_path = context.file_path(file);
+        let module = module_entry(&mut modules1, &file_path);
+        for (line, doc) in comment_vec {
+            module.items_wip.push((line, ModuleItem::DocComment(doc)));
         }
     }
+    let mut modules_which_exist: BTreeSet<_> = modules1.keys().cloned().collect();
+
+    // build a map of macro names to the module.html files in which they appear
+    let mut macro_exists = BTreeSet::new();
+    let mut macro_to_module_map = BTreeMap::new();
+    for (range, (name, define)) in define_history.iter() {
+        macro_exists.insert(name.as_str());
+        if !define.docs().is_empty() {
+            let mod_path = module_path(&context.file_path(range.start.file));
+            modules_which_exist.insert(mod_path.clone());
+            macro_to_module_map.insert(name.as_str(), mod_path);
+        }
+    }
+
+    // set up crosslink error reporting
+    let diagnostic_count: std::cell::Cell<i32> = Default::default();
+    let error_entity: std::cell::Cell<Option<String>> = Default::default();
+    let error_entity_put = |string: String| error_entity.set(Some(string));
+    let error_entity_print = || {
+        diagnostic_count.set(diagnostic_count.get() + 1);
+        if let Some(name) = error_entity.take() {
+            eprintln!("{}:", name);
+        }
+    };
 
     // (normalized, reference) -> (href, tooltip)
     let broken_link_callback = &|_: &str, reference: &str| -> Option<(String, String)> {
         // macros
         if let Some(module) = macro_to_module_map.get(reference) {
             return Some((format!("{}.html#define/{}", module, reference), reference.to_owned()));
+        } else if macro_exists.contains(reference) {
+            error_entity_print();
+            eprintln!("    [{}]: macro not documented", reference);
+            return None;
+        } else if reference.ends_with(".dm") || reference.ends_with(".txt") || reference.ends_with(".md") {
+            let mod_path = module_path(reference.as_ref());
+            if modules_which_exist.contains(&mod_path) {
+                return Some((format!("{}.html", mod_path), reference.to_owned()));
+            }
+            error_entity_print();
+            eprintln!("    [{}]: module {}", reference, if Path::new(reference).exists() { "not documented" } else { "does not exist" });
+            return None;
         }
 
         // parse "proc" or "var" reference out
-        let mut reference2 = reference;
+        let mut ty_path = reference;
         let mut proc_name = None;
         let mut var_name = None;
+        let mut entity_exists = false;
         if let Some(idx) = reference.find("/proc/") {
-            proc_name = Some(&reference[idx + "/proc/".len()..]);
-            reference2 = &reference[..idx];
+            // `[/ty/proc/procname]`
+            let name = &reference[idx + "/proc/".len()..];
+            proc_name = Some(name);
+            ty_path = &reference[..idx];
+            if let Some(ty) = objtree.find(ty_path) {
+                entity_exists = ty.procs.contains_key(name);
+            }
         } else if let Some(idx) = reference.find("/verb/") {
-            proc_name = Some(&reference[idx + "/verb/".len()..]);
-            reference2 = &reference[..idx];
+            // `[/ty/verb/procname]`
+            let name = &reference[idx + "/verb/".len()..];
+            proc_name = Some(name);
+            ty_path = &reference[..idx];
+            if let Some(ty) = objtree.find(ty_path) {
+                entity_exists = ty.procs.contains_key(name);
+            }
         } else if let Some(idx) = reference.find("/var/") {
-            var_name = Some(&reference[idx + "/var/".len()..]);
-            reference2 = &reference[..idx];
+            // `[/ty/var/varname]`
+            let name = &reference[idx + "/var/".len()..];
+            var_name = Some(name);
+            ty_path = &reference[..idx];
+            if let Some(ty) = objtree.find(ty_path) {
+                entity_exists = ty.vars.contains_key(name);
+            }
+        } else if let Some(_) = objtree.find(reference) {
+            entity_exists = true;
+        } else if let Some(idx) = reference.rfind('/') {
+            let (parent, rest) = (&reference[..idx], &reference[idx + 1..]);
+            if let Some(ty) = objtree.find(parent) {
+                if ty.procs.contains_key(rest) && !ty.vars.contains_key(rest) {
+                    // correct `[/ty/procname]` to `[/ty/proc/procname]`
+                    proc_name = Some(rest);
+                    ty_path = parent;
+                    error_entity_print();
+                    eprintln!("    [{}]: correcting to [{}/proc/{}]", reference, parent, rest);
+                    entity_exists = true;
+                } else if ty.vars.contains_key(rest) {
+                    // correct `[/ty/varname]` to `[/ty/var/varname]`
+                    var_name = Some(rest);
+                    ty_path = parent;
+                    error_entity_print();
+                    eprintln!("    [{}]: correcting to [{}/var/{}]", reference, parent, rest);
+                    entity_exists = true;
+                }
+            }
+        } else if objtree.root().vars.contains_key(reference) {
+            ty_path = "";
+            var_name = Some(reference);
+            error_entity_print();
+            eprintln!("    [{0}]: correcting to [/var/{0}]", reference);
+            entity_exists = true;
         }
+        // else `[/ty]`
 
         let mut progress = String::new();
         let mut best = 0;
 
-        if reference2.is_empty() {
+        if ty_path.is_empty() {
             progress.push_str("/global");
             if let Some(info) = types_with_docs.get("") {
                 if let Some(proc_name) = proc_name {
@@ -181,7 +268,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            for bit in reference2.trim_start_matches('/').split('/') {
+            for bit in ty_path.trim_start_matches('/').split('/') {
                 progress.push_str("/");
                 progress.push_str(bit);
                 if let Some(info) = types_with_docs.get(progress.as_str()) {
@@ -204,7 +291,18 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             use std::fmt::Write;
 
             if best < progress.len() {
-                eprintln!("crosslink [{}] approximating to [{}]", reference, &progress[..best]);
+                error_entity_print();
+                if entity_exists {
+                    eprint!("    [{}]: not documented, guessing [{}", reference, &progress[..best]);
+                } else {
+                    eprint!("    [{}]: unknown crosslink, guessing [{}", reference, &progress[..best]);
+                }
+                if let Some(proc_name) = proc_name {
+                    let _ = eprint!("/proc/{}", proc_name);
+                } else if let Some(var_name) = var_name {
+                    let _ = eprint!("/var/{}", var_name);
+                }
+                eprintln!("]");
                 progress.truncate(best);
             }
 
@@ -214,24 +312,17 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             } else if let Some(var_name) = var_name {
                 let _ = write!(href, "#var/{}", var_name);
             }
-            return Some((href, progress));
+            Some((href, progress))
+        } else {
+            error_entity_print();
+            if entity_exists {
+                eprintln!("    [{}]: not documented", reference);
+            } else {
+                eprintln!("    [{}]: unknown crosslink", reference);
+            }
+            None
         }
-
-        eprintln!("crosslink [{}] unknown", reference);
-        None
     };
-
-    // collate modules which have docs
-    let mut modules1 = BTreeMap::new();
-    let mut macro_count = 0;
-    let mut macros_all = 0;
-    for (file, comment_vec) in module_docs {
-        let file_path = context.file_path(file);
-        let module = module_entry(&mut modules1, &file_path);
-        for (line, doc) in comment_vec {
-            module.items_wip.push((line, ModuleItem::DocComment(doc)));
-        }
-    }
 
     // if macros have docs, that counts as a module too
     for (range, (name, define)) in define_history.iter() {
@@ -259,6 +350,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
         if docs.is_empty() {
             continue;
         }
+        error_entity_put(format!("#define {}", name));
         let docs = DocBlock::parse(&docs.text(), Some(broken_link_callback));
         let module = module_entry(&mut modules1, &context.file_path(range.start.file));
         module.items_wip.push((
@@ -304,6 +396,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
     let mut index_docs = None;
     if let Some(index_path) = index_path {
         let buf = read_as_markdown(index_path.as_ref())?.expect("file for --index must be .md or .txt");
+        error_entity_put(index_path.to_owned());
         index_docs = Some(DocBlock::parse_with_title(&buf, Some(broken_link_callback)));
     }
 
@@ -336,6 +429,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
         let mut anything = false;
         let mut substance = false;
         if !ty.docs.is_empty() {
+            error_entity_put(ty.path.to_owned());
             let (title, block) = DocBlock::parse_with_title(&ty.docs.text(), Some(broken_link_callback));
             if let Some(title) = title {
                 parsed_type.name = title.into();
@@ -367,6 +461,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
                     next = current.parent_type();
                 }
 
+                error_entity_put(format!("{}/var/{}", ty.path, name));
                 let block = DocBlock::parse(&var.value.docs.text(), Some(broken_link_callback));
                 // `type` is pulled from the parent if necessary
                 let type_ = ty.get_var_declaration(name).map(|decl| VarType {
@@ -409,6 +504,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
                     next = current.parent_type();
                 }
 
+                error_entity_put(format!("{}/proc/{}", ty.path, name));
                 let block = DocBlock::parse(&proc_value.docs.text(), Some(broken_link_callback));
                 parsed_type.procs.insert(name, Proc {
                     docs: block,
@@ -503,6 +599,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             }
         }}
 
+        error_entity_put(module.orig_filename.to_owned());
         let mut last_line = 0;
         items_wip.sort_by_key(|&(line, _)| line);
         for (line, item) in items_wip.drain(..) {
@@ -545,6 +642,14 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             count,
             (type_docs.len() * 1000 / count) as f32 / 10.
         );
+    }
+
+    {
+        // Ensure the diagnostic count is not increased after this point.
+        let exit_code = diagnostic_count.into_inner();
+        if dry_run {
+            std::process::exit(exit_code);
+        }
     }
 
     // load tera templates

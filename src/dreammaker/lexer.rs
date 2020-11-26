@@ -6,6 +6,7 @@ use std::borrow::Cow;
 
 use super::{DMError, Location, HasLocation, FileId, Context, Severity};
 use super::docs::*;
+use super::ast::Ident;
 
 macro_rules! table {
     (
@@ -231,7 +232,7 @@ pub enum Token {
     /// A punctuation symbol.
     Punct(Punctuation),
     /// A raw identifier or keyword. Indicates whether it is followed by whitespace.
-    Ident(String, bool),
+    Ident(Ident, bool),
     /// A string literal with no interpolation.
     String(String),
     /// The opening portion of an interpolated string. Followed by an expression.
@@ -313,13 +314,12 @@ impl Token {
 
     /// Check whether this token is whitespace.
     pub fn is_whitespace(&self) -> bool {
-        match *self {
-            Token::Punct(Punctuation::Tab) |
-            Token::Punct(Punctuation::Newline) |
-            Token::Punct(Punctuation::Space) |
-            Token::Eof => true,
-            _ => false
-        }
+        matches!(*self,
+            Token::Punct(Punctuation::Tab)
+            | Token::Punct(Punctuation::Newline)
+            | Token::Punct(Punctuation::Space)
+            | Token::Eof
+        )
     }
 
     /// Check whether this token matches a given identifier.
@@ -748,6 +748,11 @@ impl<'ctx> Lexer<'ctx> {
             if ch == b'\r' {
                 // not listening
             } else if backslash {
+                if ch == b'\n' {
+                    self.error("backslash in line comment may be commenting out the following line")
+                        .set_severity(Severity::Warning)
+                        .register(self.context);
+                }
                 backslash = false;
             } else if ch == b'\n' {
                 self.put_back(Some(ch));

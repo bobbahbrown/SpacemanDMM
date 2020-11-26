@@ -110,7 +110,7 @@ impl RenderPass for Random {
             } else {
                 sprite.icon_state = bumpalo::format!(in bump, "poster{}_legit", i - CONTRABAND_POSTERS).into_bump_str();
             }
-        } else if atom.istype("/obj/item/twohanded/required/kirbyplants/random/") {
+        } else if atom.istype("/obj/item/kirbyplants/random/") || atom.istype("/obj/item/twohanded/required/kirbyplants/random/") {
             sprite.icon = "icons/obj/flora/plants.dmi";
             let random = rng.gen_range(0, 26);
             if random == 0 {
@@ -139,6 +139,18 @@ impl RenderPass for Random {
                     sprite.icon_state = c;
                 }
             }
+        } else if atom.istype("/obj/item/relic/") {
+	        sprite.icon_state = [
+                "shock_kit",
+                "armor-igniter-analyzer",
+                "infra-igniter0",
+                "infra-igniter1",
+                "radio-multitool",
+                "prox-radio1",
+                "radio-radio",
+                "timer-multitool0",
+                "radio-igniter-tank",
+            ].choose(&mut rng).unwrap();
         }
 
         if atom.istype("/obj/item/lipstick/random/") {

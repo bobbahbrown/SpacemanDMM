@@ -1063,7 +1063,7 @@ handle_method_call! {
             capabilities: ServerCapabilities {
                 definition_provider: Some(true),
                 workspace_symbol_provider: Some(true),
-                hover_provider: Some(true),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 document_symbol_provider: Some(true),
                 references_provider: Some(true),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
@@ -1083,6 +1083,10 @@ handle_method_call! {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: None,
+                    work_done_progress_options: Default::default(),
+                }),
                 color_provider: Some(ColorProviderCapability::Simple(true)),
                 .. Default::default()
             },
@@ -1099,6 +1103,7 @@ handle_method_call! {
 
     // ------------------------------------------------------------------------
     // actual stuff provision
+    #[allow(deprecated)]  // DocumentSymbol::deprecated is... deprecated. But we need to provide a `None` anyways.
     on WorkspaceSymbol(&mut self, params) {
         let query = symbol_search::Query::parse(&params.query);
 
@@ -1694,6 +1699,7 @@ handle_method_call! {
         result
     }
 
+    #[allow(deprecated)]  // DocumentSymbol::deprecated is... deprecated. But we need to provide a `None` anyways.
     on DocumentSymbolRequest(&mut self, params) {
         fn name_and_detail(path: &[String]) -> (String, Option<String>) {
             let (name, rest) = path.split_last().unwrap();
@@ -1846,6 +1852,39 @@ handle_method_call! {
                 .. Default::default()
             },
         ]
+    }
+
+    on DocumentLinkRequest(&mut self, params) {
+        let (_, file_id, annotations) = self.get_annotations(&params.text_document.uri)?;
+        if annotations.is_empty() {
+            None
+        } else {
+            let mut results = Vec::new();
+            for (span, annotation) in annotations.iter() {
+                if span.start.file != file_id {
+                    continue;
+                }
+                match annotation {
+                    Annotation::Include(path) |
+                    Annotation::Resource(path) => {
+                        let pathbuf = if path.is_relative() {
+                            std::env::current_dir().map_err(invalid_request)?.join(&path)
+                        } else {
+                            path.to_owned()
+                        };
+                        results.push(DocumentLink {
+                            range: span_to_range(span.start..span.end.add_columns(1)),
+                            target: Some(path_to_url(pathbuf)?),
+                            tooltip: None,
+                            data: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(results)
+        }
     }
 
     // ------------------------------------------------------------------------

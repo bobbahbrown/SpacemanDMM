@@ -31,7 +31,6 @@ mod dap_types;
 mod launched;
 mod extools_types;
 mod extools;
-mod local_names;
 mod extools_bundle;
 mod evaluate;
 
@@ -142,7 +141,6 @@ impl DebugDatabaseBuilder {
             files,
             objtree,
             line_numbers,
-            local_names: Default::default(),
         }
     }
 }
@@ -152,7 +150,6 @@ pub struct DebugDatabase {
     files: dm::FileList,
     objtree: Arc<ObjectTree>,
     line_numbers: HashMap<dm::FileId, Vec<(i64, String, String, usize)>>,
-    local_names: HashMap<(String, usize), Option<Vec<String>>>,
 }
 
 fn get_proc<'o>(objtree: &'o ObjectTree, proc_ref: &str, override_id: usize) -> Option<&'o dm::objtree::ProcValue> {
@@ -178,18 +175,6 @@ fn get_proc<'o>(objtree: &'o ObjectTree, proc_ref: &str, override_id: usize) -> 
 impl DebugDatabase {
     fn get_proc(&self, proc_ref: &str, override_id: usize) -> Option<&dm::objtree::ProcValue> {
         get_proc(&self.objtree, proc_ref, override_id)
-    }
-
-    fn get_local_names(&mut self, proc_ref: &str, override_id: usize) -> Option<&[String]> {
-        let objtree = &self.objtree;
-        self.local_names.entry((proc_ref.to_owned(), override_id)).or_insert_with(|| {
-            let proc = get_proc(objtree, proc_ref, override_id)?;
-            if let dm::objtree::Code::Present(ref code) = proc.code {
-                Some(local_names::extract(code))
-            } else {
-                None
-            }
-        }).as_ref().map(|x| &x[..])
     }
 
     fn file_id(&self, file_path: &str) -> Option<FileId> {
@@ -288,6 +273,36 @@ impl Debugger {
     #[inline]
     fn issue_event<E: Event>(&mut self, event: E) {
         self.seq.issue_event(event);
+    }
+
+    fn notify_continue(&mut self) {
+        // Called when a Step occurs so we can tell VSC that actually you can't
+        // do that on a per-thread basis in DM.
+        self.cull_thread_list();
+        self.issue_event(dap_types::ContinuedEvent {
+            threadId: 0,
+            allThreadsContinued: Some(true),
+        });
+    }
+
+    fn cull_thread_list(&mut self) {
+        // Cull threads other than the main thread so that VSC goes back to
+        // acting like the application is single-threaded, rather than showing
+        // the last-known sleeping stacks every time.
+
+        // An alternative would be to send these in real-time when sleeping
+        // threads enter or exit existence.
+
+        let keys: Vec<_> = {
+            guard!(let Ok(extools) = self.extools.get() else { return });
+            extools.get_all_threads().keys().cloned().filter(|&k| k != 0).collect()
+        };
+        for k in keys {
+            self.issue_event(dap_types::ThreadEvent {
+                reason: dap_types::ThreadEvent::REASON_EXITED.to_owned(),
+                threadId: k,
+            });
+        }
     }
 }
 
@@ -388,8 +403,25 @@ handle_request! {
     }
 
     on Threads(&mut self, ()) {
+        let mut threads = Vec::new();
+
+        let extools = self.extools.get()?;
+        for (&k, v) in extools.get_all_threads().iter() {
+            threads.push(Thread {
+                id: k,
+                name: v.call_stack.last().unwrap().proc.clone(),
+            });
+        }
+
+        if threads.is_empty() {
+            threads.push(Thread {
+                id: 0,
+                name: "Main".to_owned(),
+            });
+        }
+
         ThreadsResponse {
-            threads: vec![Thread { id: 0, name: "Main".to_owned() }]
+            threads,
         }
     }
 
@@ -440,6 +472,11 @@ handle_request! {
                         .. Default::default()
                     });
                 } else {
+                    debug_output!(in self.seq,
+                        "Couldn't find line {} in the following disassembly:\n{}",
+                        sbp.line,
+                        Self::format_disassembly(extools.bytecode(&proc, override_id)));
+
                     breakpoints.push(Breakpoint {
                         message: Some("Unable to determine offset in proc".to_owned()),
                         line: Some(sbp.line),
@@ -541,10 +578,16 @@ handle_request! {
         for (i, ex_frame) in thread.call_stack.into_iter().enumerate() {
             let mut dap_frame = StackFrame {
                 name: ex_frame.proc.clone(),
-                id: i as i64,
+                id: (i * extools.get_all_threads().len()) as i64 + params.threadId,
                 instructionPointerReference: Some(format!("{}@{}#{}", ex_frame.proc, ex_frame.override_id, ex_frame.offset)),
                 .. Default::default()
             };
+
+            if i == 0 {
+                // Column must be nonzero for VSC to show the exception widget,
+                // but we don't usually have meaningful column information.
+                dap_frame.column = 1;
+            }
 
             if let Some(proc) = self.db.get_proc(&ex_frame.proc, ex_frame.override_id) {
                 if proc.location.is_builtins() {
@@ -557,7 +600,7 @@ handle_request! {
                                 .. Default::default()
                             });
                             dap_frame.line = i64::from(proc.location.line);
-                            dap_frame.column = i64::from(proc.location.column);
+                            //dap_frame.column = i64::from(proc.location.column);
                         }
                     }
                 } else {
@@ -573,14 +616,12 @@ handle_request! {
                         .. Default::default()
                     });
                     dap_frame.line = i64::from(proc.location.line);
-                    dap_frame.column = i64::from(proc.location.column);
+                    //dap_frame.column = i64::from(proc.location.column);
                 }
             }
 
             if let Some(line) = extools.offset_to_line(&ex_frame.proc, ex_frame.override_id, ex_frame.offset) {
                 dap_frame.line = line;
-                // Column must be nonzero for VSC to show the exception widget.
-                dap_frame.column = 1;
             }
 
             frames.push(dap_frame);
@@ -594,9 +635,14 @@ handle_request! {
 
     on Scopes(&mut self, ScopesArguments { frameId }) {
         let extools = self.extools.get()?;
-        let thread = extools.get_default_thread()?;
-        guard!(let Some(frame) = thread.call_stack.get(frameId as usize) else {
-            return Err(Box::new(GenericError("Stack frame out of range")));
+        let frame_id = frameId as usize;
+
+        let threads = extools.get_all_threads();
+        let thread_id = (frame_id % threads.len()) as i64;
+        let frame_no = frame_id / threads.len();
+
+        guard!(let Some(frame) = threads[&thread_id].call_stack.get(frame_no) else {
+            return Err(Box::new(GenericError2(format!("Stack frame out of range: {} (thread {}, depth {})", frameId, thread_id, frame_no))));
         });
 
         ScopesResponse {
@@ -680,35 +726,27 @@ handle_request! {
         }
 
         // Stack frame, arguments or locals
-        let frame_idx = (params.variablesReference - 1) / 2;
+        let frame_id = (params.variablesReference - 1) / 2;
         let mod2 = params.variablesReference % 2;
 
-        // TODO: variablesReference should be different based on thread ID
-        let thread = extools.get_default_thread()?;
-        guard!(let Some(frame) = thread.call_stack.get(frame_idx as usize) else {
+        let (thread, frame_no) = extools.get_thread_by_frame_id(frame_id)?;
+        guard!(let Some(frame) = thread.call_stack.get(frame_no) else {
             return Err(Box::new(GenericError("Stack frame out of range")));
         });
-
-        let (parameters, locals);
-        let objtree = self.db.objtree.clone();
-        if let Some(proc) = get_proc(&objtree, &frame.proc, frame.override_id) {
-            parameters = &proc.parameters[..];
-            locals = self.db.get_local_names(&frame.proc, frame.override_id).unwrap_or(&[]);
-        } else {
-            parameters = &[];
-            locals = &[];
-        }
 
         if mod2 == 1 {
             // arguments
             let mut variables = Vec::with_capacity(2 + frame.args.len());
+            let mut seen = std::collections::HashMap::new();
 
+            seen.insert("src", 0);
             variables.push(Variable {
                 name: "src".to_owned(),
                 value: frame.src.to_string(),
                 variablesReference: frame.src.to_variables_reference(),
                 .. Default::default()
             });
+            seen.insert("usr", 0);
             variables.push(Variable {
                 name: "usr".to_owned(),
                 value: frame.usr.to_string(),
@@ -717,9 +755,14 @@ handle_request! {
             });
 
             variables.extend(frame.args.iter().enumerate().map(|(i, vt)| Variable {
-                name: match parameters.get(i) {
-                    Some(param) => param.name.clone(),
-                    None => i.to_string(),
+                name: match frame.arg_names.get(i) {
+                    Some(param) => {
+                        match seen.entry(param).and_modify(|e| *e += 1).or_default() {
+                            0 => param.clone(),
+                            n => format!("{} #{}", param, n),
+                        }
+                    }
+                    None => format!("args[{}]", i + 1),
                 },
                 value: vt.to_string(),
                 variablesReference: vt.to_variables_reference(),
@@ -741,7 +784,7 @@ handle_request! {
             // displays the first one. Avert this by adding suffixes.
             let mut seen = std::collections::HashMap::new();
             variables.extend(frame.locals.iter().enumerate().map(|(i, vt)| Variable {
-                name: match locals.get(i) {
+                name: match frame.local_names.get(i) {
                     Some(local) => {
                         match seen.entry(local).and_modify(|e| *e += 1).or_default() {
                             0 => local.clone(),
@@ -761,6 +804,7 @@ handle_request! {
     }
 
     on Continue(&mut self, _params) {
+        self.cull_thread_list();
         let extools = self.extools.get()?;
         extools.continue_execution();
         ContinueResponse {
@@ -769,13 +813,21 @@ handle_request! {
     }
 
     on StepIn(&mut self, params) {
+        self.notify_continue();
         let extools = self.extools.get()?;
         extools.step_in(params.threadId);
     }
 
     on Next(&mut self, params) {
+        self.notify_continue();
         let extools = self.extools.get()?;
         extools.step_over(params.threadId);
+    }
+
+    on StepOut(&mut self, params) {
+        self.notify_continue();
+        let extools = self.extools.get()?;
+        extools.step_out(params.threadId);
     }
 
     on Pause(&mut self, _params) {
@@ -944,6 +996,19 @@ impl Error for GenericError {
 impl std::fmt::Display for GenericError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.write_str(self.0)
+    }
+}
+
+#[derive(Debug)]
+pub struct GenericError2(String);
+
+impl Error for GenericError2 {
+    fn description(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for GenericError2 {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.write_str(&self.0)
     }
 }
 

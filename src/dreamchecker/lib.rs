@@ -360,18 +360,19 @@ fn run_inner(context: &Context, objtree: &ObjectTree, cli: bool) {
     cli_println!("Procs analyzed: {}. Errored: {}. Builtins: {}.\n", present, invalid, builtin);
 
     cli_println!("============================================================");
-    cli_println!("Analyzing proc call tree...\n");
-    analyzer.check_proc_call_tree();
-
-    cli_println!("============================================================");
     cli_println!("Analyzing proc override validity...\n");
     objtree.root().recurse(&mut |ty| {
         for proc in ty.iter_self_procs() {
             analyzer.check_kwargs(proc);
+            analyzer.propagate_violations(proc);
         }
     });
 
     analyzer.finish_check_kwargs();
+
+    cli_println!("============================================================");
+    cli_println!("Analyzing proc call tree...\n");
+    analyzer.check_proc_call_tree();
 }
 
 // ----------------------------------------------------------------------------
@@ -490,13 +491,13 @@ impl<'o> CallStack<'o> {
 }
 
 trait DMErrorExt {
-    fn with_callstack(self, stack: CallStack) -> Self;
+    fn with_callstack(self, stack: &CallStack) -> Self;
     fn with_blocking_builtins(self, blockers: &Vec<(String, Location)>) -> Self;
     fn with_impure_operations(self, impures: &Vec<(String, Location)>) -> Self;
 }
 
 impl DMErrorExt for DMError {
-    fn with_callstack(mut self, stack: CallStack) -> DMError {
+    fn with_callstack(mut self, stack: &CallStack) -> DMError {
         for (procref, location, new_context) in stack.call_stack.iter() {
             self.add_note(*location, format!("{}() called here", procref));
         }
@@ -533,6 +534,21 @@ impl<'o> ViolatingProcs<'o> {
     }
 }
 
+#[derive(Default, Debug)]
+pub struct ViolatingOverrides<'o> {
+    overrides: HashMap<ProcRef<'o>, Vec<ProcRef<'o>>>,
+}
+
+impl<'o> ViolatingOverrides<'o> {
+    pub fn insert_override(&mut self, proc: ProcRef<'o>, child: ProcRef<'o>) {
+        self.overrides.entry(proc).or_default().push(child);
+    }
+
+    pub fn get_override_violators(&self, proc: ProcRef<'o>) -> Option<&Vec<ProcRef<'o>>> {
+        self.overrides.get(&proc)
+    }
+}
+
 /// A deeper analysis of an ObjectTree
 pub struct AnalyzeObjectTree<'o> {
     context: &'o Context,
@@ -555,6 +571,9 @@ pub struct AnalyzeObjectTree<'o> {
     sleeping_procs: ViolatingProcs<'o>,
     impure_procs: ViolatingProcs<'o>,
     waitfor_procs: HashSet<ProcRef<'o>>,
+
+    sleeping_overrides: ViolatingOverrides<'o>,
+    impure_overrides: ViolatingOverrides<'o>,
 }
 
 impl<'o> AnalyzeObjectTree<'o> {
@@ -579,6 +598,8 @@ impl<'o> AnalyzeObjectTree<'o> {
             sleeping_procs: Default::default(),
             impure_procs: Default::default(),
             waitfor_procs: Default::default(),
+            sleeping_overrides: Default::default(),
+            impure_overrides: Default::default(),
         }
     }
 
@@ -633,13 +654,6 @@ impl<'o> AnalyzeObjectTree<'o> {
 
     pub fn check_proc_call_tree(&mut self) {
         for (procref, &(_, location)) in self.must_not_sleep.directive.iter() {
-            if let Some(_) = self.waitfor_procs.get(&procref) {
-                error(procref.get().location, format!("{} sets SpacemanDMM_should_not_sleep but also sets waitfor = 0", procref))
-                    .with_note(location, "SpacemanDMM_should_not_sleep set here")
-                    .with_errortype("must_not_sleep")
-                    .register(self.context);
-                continue
-            }
             if let Some(sleepvec) = self.sleeping_procs.get_violators(*procref) {
                 error(procref.get().location, format!("{} sets SpacemanDMM_should_not_sleep but calls blocking built-in(s)", procref))
                     .with_note(location, "SpacemanDMM_should_not_sleep set here")
@@ -673,9 +687,21 @@ impl<'o> AnalyzeObjectTree<'o> {
                     error(procref.get().location, format!("{} sets SpacemanDMM_should_not_sleep but calls blocking proc {}", procref, nextproc))
                         .with_note(location, "SpacemanDMM_should_not_sleep set here")
                         .with_errortype("must_not_sleep")
-                        .with_callstack(callstack)
+                        .with_callstack(&callstack)
                         .with_blocking_builtins(sleepvec)
                         .register(self.context)
+                } else if let Some(overridesleep) = self.sleeping_overrides.get_override_violators(nextproc) {
+                    for child_violator in overridesleep {
+                        if procref.ty().is_subtype_of(&nextproc.ty()) && !child_violator.ty().is_subtype_of(&procref.ty()) {
+                            continue
+                        }
+                        error(procref.get().location, format!("{} calls {} which has override child proc that sleeps {}", procref, nextproc, child_violator))
+                            .with_note(location, "SpacemanDMM_should_not_sleep set here")
+                            .with_errortype("must_not_sleep")
+                            .with_callstack(&callstack)
+                            .with_blocking_builtins(self.sleeping_procs.get_violators(*child_violator).unwrap())
+                            .register(self.context)
+                    }
                 } else if let Some(calledvec) = self.call_tree.get(&nextproc) {
                     for (proccalled, location, new_context) in calledvec.iter() {
                         let mut newstack = callstack.clone();
@@ -711,9 +737,21 @@ impl<'o> AnalyzeObjectTree<'o> {
                     error(procref.get().location, format!("{} sets SpacemanDMM_should_be_pure but calls a {} that does impure operations", procref, nextproc))
                         .with_note(*location, "SpacemanDMM_should_be_pure set here")
                         .with_errortype("must_be_pure")
-                        .with_callstack(callstack)
+                        .with_callstack(&callstack)
                         .with_impure_operations(impurevec)
                         .register(self.context)
+                } else if let Some(overrideimpure) = self.impure_overrides.get_override_violators(nextproc) {
+                    for child_violator in overrideimpure {
+                        if procref.ty().is_subtype_of(&nextproc.ty()) && !child_violator.ty().is_subtype_of(&procref.ty()) {
+                            continue
+                        }
+                        error(procref.get().location, format!("{} calls {} which has override child proc that does impure operations {}", procref, nextproc, child_violator))
+                            .with_note(*location, "SpacemanDMM_should_not_pure set here")
+                            .with_errortype("must_be_pure")
+                            .with_callstack(&callstack)
+                            .with_blocking_builtins(self.impure_procs.get_violators(*child_violator).unwrap())
+                            .register(self.context)
+                    }
                 } else if let Some(calledvec) = self.call_tree.get(&nextproc) {
                     for (proccalled, location, new_context) in calledvec.iter() {
                         let mut newstack = callstack.clone();
@@ -790,6 +828,27 @@ impl<'o> AnalyzeObjectTree<'o> {
                 }
             } else {
                 break;
+            }
+        }
+    }
+
+    /// Propagate violations make up the inheritence graph
+    pub fn propagate_violations(&mut self, proc: ProcRef<'o>) {
+        if proc.name() == "New" { // New() propogates via ..() and causes weirdness
+            return;
+        }
+        if self.sleeping_procs.get_violators(proc).is_some() {
+            let mut next = proc.parent_proc();
+            while let Some(current) = next {
+                self.sleeping_overrides.insert_override(current, proc);
+                next = current.parent_proc();
+            }
+        }
+        if self.impure_procs.get_violators(proc).is_some() {
+            let mut next = proc.parent_proc();
+            while let Some(current) = next {
+                self.impure_overrides.insert_override(current, proc);
+                next = current.parent_proc();
             }
         }
     }
@@ -1169,6 +1228,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
         for stmt in block.iter() {
             if term.terminates() {
                 error(stmt.location,"possible unreachable code here")
+                    .with_errortype("unreachable_code")
                     .register(self.context);
                 return term // stop evaluating
             }
@@ -1182,10 +1242,12 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
         match expression.is_truthy() {
             Some(true) => {
                 error(location,"loop condition is always true")
+                    .with_errortype("loop_condition_determinate")
                     .register(self.context);
             },
             Some(false) => {
                 error(location,"loop condition is always false")
+                    .with_errortype("loop_condition_determinate")
                     .register(self.context);
             }
             _ => ()
@@ -1195,7 +1257,8 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
     fn visit_control_condition(&mut self, location: Location, expression: &'o Expression) {
         if expression.is_const_eval() {
             error(location,"control flow condition is a constant evalutation")
-                    .register(self.context);
+                .with_errortype("control_condition_static")
+                .register(self.context);
         }
         else if let Some(term) = expression.as_term() {
             if term.is_static() {
@@ -1237,6 +1300,11 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
             },
             Statement::Return(Some(expr)) => {
                 // TODO: factor in the previous return type if there was one
+                if self.inside_newcontext > 0 {
+                    error(location, "returning a value in a spawn has no effect")
+                        .set_severity(Severity::Warning)
+                        .register(self.context);
+                }
                 let return_type = self.visit_expression(location, expr, None, local_vars);
                 local_vars.get_mut(".").unwrap().analysis = return_type;
                 return ControlFlow { returns: true, continues: false, breaks: false, fuzzy: false }
@@ -1249,6 +1317,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
             Statement::Throw(expr) => { self.visit_expression(location, expr, None, local_vars); },
             Statement::While { condition, block } => {
                 let mut scoped_locals = local_vars.clone();
+                // We don't check for static/determine conditions because while(TRUE) is so common.
                 self.visit_expression(location, condition, None, &mut scoped_locals);
                 let mut state = self.visit_block(block, &mut scoped_locals);
                 state.end_loop();
@@ -1275,6 +1344,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                     self.visit_control_condition(condition.location, &condition.elem);
                     if alwaystrue {
                         error(condition.location,"unreachable if block, preceeding if/elseif condition(s) are always true")
+                            .with_errortype("unreachable_code")
                             .register(self.context);
                     }
                     self.visit_expression(condition.location, &condition.elem, None, &mut scoped_locals);
@@ -1299,6 +1369,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                     if alwaystrue {
                         if let Some(else_expr) = else_arm.first() {
                             error(else_expr.location ,"unreachable else block, preceeding if/elseif condition(s) are always true")
+                                .with_errortype("unreachable_code")
                                 .register(self.context);
                         }
                     }
@@ -1378,7 +1449,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                 let mut state = self.visit_block(block, &mut scoped_locals);
                 if let Some(startterm) = start.as_term() {
                     if let Some(endterm) = end.as_term() {
-                        if let Some(validity) = startterm.valid_for_range(endterm, step) {
+                        if let Some(validity) = startterm.valid_for_range(endterm, step.as_deref()) {
                             if !validity {
                                 error(location,"for range loop body is never reached due to invalid range")
                                     .register(self.context);
@@ -1655,10 +1726,13 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
             },
 
             Term::Call(unscoped_name, args) => {
-                if unscoped_name == "sleep" || unscoped_name == "alert" || unscoped_name == "shell" || unscoped_name == "winexists" || unscoped_name == "winget" {
-                    if self.inside_newcontext == 0 {
+                if self.inside_newcontext == 0 && matches!(unscoped_name.as_str(),
+                    "sleep"
+                    | "alert"
+                    | "shell"
+                    | "winexists"
+                    | "winget") {
                         self.env.sleeping_procs.insert_violator(self.proc_ref, unscoped_name, location);
-                    }
                 }
                 let src = self.ty;
                 if let Some(proc) = self.ty.get_proc(unscoped_name) {
@@ -1694,6 +1768,7 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                     self.visit_call(location, src, proc, args, true, local_vars)
                 } else {
                     error(location, format!("proc has no parent: {}", self.proc_ref))
+                        .with_errortype("proc_has_no_parent")
                         .register(self.context);
                     Analysis::empty()
                 }
@@ -1785,7 +1860,8 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                     self.visit_expression(location, expr, None, local_vars);
                 }
 
-                let without_null = *input_type - InputType::NULL;
+                let input_type = input_type.unwrap_or_else(InputType::empty);
+                let without_null = input_type - InputType::NULL;
                 if input_type.contains(InputType::ANYTHING) {
                     Analysis::empty()
                 } else if without_null == InputType::MOB {
@@ -1928,6 +2004,13 @@ impl<'o, 's> AnalyzeProc<'o, 's> {
                                     .with_errortype("protected_proc")
                                     .with_note(decllocation, "prohibited by this protected_proc annotation")
                                     .register(self.context);
+                            }
+                        }
+                        if ty.get().path.as_str() == "/world" {
+                            if self.inside_newcontext == 0 && matches!(name.as_str(),
+                                "Import"
+                                | "Export") {
+                                self.env.sleeping_procs.insert_violator(self.proc_ref, format!("world.{}", name).as_str(), location);
                             }
                         }
                         self.visit_call(location, ty, proc, arguments, false, local_vars)

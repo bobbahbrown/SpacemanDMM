@@ -17,7 +17,7 @@ use super::preprocessor::DefineMap;
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct Pop {
     pub path: TreePath,
-    pub vars: LinkedHashMap<String, Constant>,
+    pub vars: LinkedHashMap<Ident, Constant>,
 }
 
 impl From<TreePath> for Pop {
@@ -70,7 +70,7 @@ pub enum Constant {
 // upstream properties without having to wrap/unwrap at all hours of the day.
 impl std::hash::Hash for Constant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(&self).hash(state);
+        std::mem::discriminant(self).hash(state);
         match self {
             Constant::Null(p) => p.hash(state),
             Constant::New { type_, args } => (type_, args).hash(state),
@@ -130,6 +130,8 @@ impl Constant {
     // ------------------------------------------------------------------------
     // Constructors
 
+    pub const EMPTY_STRING: &'static Constant = &Constant::String(String::new());
+
     pub fn null() -> &'static Constant {
         static NULL: Constant = Constant::Null(None);
         &NULL
@@ -145,10 +147,7 @@ impl Constant {
 
     #[inline]
     pub fn is_null(&self) -> bool {
-        match *self {
-            Constant::Null(_) => true,
-            _ => false,
-        }
+        matches!(*self, Constant::Null(_))
     }
 
     pub fn to_bool(&self) -> bool {
@@ -717,7 +716,7 @@ impl<'a> ConstantFolder<'a> {
             Term::Null => Constant::Null(type_hint.cloned()),
             Term::New { type_, args } => Constant::New {
                 type_: match type_ {
-                    NewType::Prefab(e) => Some(self.prefab(e)?),
+                    NewType::Prefab(e) => Some(self.prefab(*e)?),
                     NewType::Implicit => None,
                     NewType::MiniExpr { .. } => return Err(self.error("non-constant new expression")),
                 },
@@ -745,7 +744,7 @@ impl<'a> ConstantFolder<'a> {
                         return Err(self.error(format!("malformed rgb() call, must have 3 or 4 arguments and instead has {}", args.len())));
                     }
                     let mut result = String::with_capacity(7);
-                    result.push_str("#");
+                    result.push('#');
                     for each in args {
                         if let Some(i) = self.expr(each, None)?.to_int() {
                             let clamped = std::cmp::max(::std::cmp::min(i, 255), 0);
@@ -761,12 +760,8 @@ impl<'a> ConstantFolder<'a> {
                     if args.len() != 1 {
                         return Err(self.error(format!("malformed defined() call, must have 1 argument and instead has {}", args.len())));
                     }
-                    match args[0] {
-                        Expression::Base {
-                            ref unary,
-                            term: Spanned { elem: Term::Ident(ref ident), .. },
-                            ref follow
-                        } if unary.is_empty() && follow.is_empty() => {
+                    match args[0].as_term() {
+                        Some(Term::Ident(ref ident)) => {
                             Constant::Int(if defines.contains_key(ident) { 1 } else { 0 })
                         },
                         _ => return Err(self.error("malformed defined() call, argument given isn't an Ident.")),
@@ -775,7 +770,7 @@ impl<'a> ConstantFolder<'a> {
                 // other functions are no-goes
                 _ => return Err(self.error(format!("non-constant function call: {}", ident))),
             },
-            Term::Prefab(prefab) => Constant::Prefab(self.prefab(prefab)?),
+            Term::Prefab(prefab) => Constant::Prefab(self.prefab(*prefab)?),
             Term::Ident(ident) => self.ident(ident, false)?,
             Term::String(v) => Constant::String(v),
             Term::Resource(v) => Constant::Resource(v),
@@ -825,7 +820,7 @@ impl<'a> ConstantFolder<'a> {
         Ok(Pop { path, vars })
     }
 
-    fn vars(&mut self, input: LinkedHashMap<String, Expression>) -> Result<LinkedHashMap<String, Constant>, DMError> {
+    fn vars(&mut self, input: LinkedHashMap<Ident, Expression>) -> Result<LinkedHashMap<Ident, Constant>, DMError> {
         // Visit the vars recursively.
         let mut vars = LinkedHashMap::new();
         for (k, v) in input {
@@ -835,7 +830,7 @@ impl<'a> ConstantFolder<'a> {
         Ok(vars)
     }
 
-    fn ident(&mut self, ident: String, must_be_const: bool) -> Result<Constant, DMError> {
+    fn ident(&mut self, ident: Ident, must_be_const: bool) -> Result<Constant, DMError> {
         let ty = self.ty;
         self.recursive_lookup(ty, &ident, must_be_const)
     }
